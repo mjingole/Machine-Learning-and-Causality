@@ -1,0 +1,185 @@
+---
+title: "causal_tree"
+author: "Mayur Ingole"
+date: "04/06/2020"
+output: html_document
+always_allow_html: True
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r code, include=FALSE}
+# LIBRARIES
+library(tidyverse)
+library(lubridate)
+library(grf) # Generalized Random Forest for CausalTree estimation of heterogenous treatent effect
+library(imputeTS)
+library(gghighlight)
+library(DiagrammeR)
+
+# DATA IMPORT
+WDIData <- read.csv("WDIData 1960-2019.csv", stringsAsFactors = F)
+WDISeries <- read.csv("WDISeries.csv", stringsAsFactors = F)
+brent_month <- read.csv("brent-month_csv 1987-2020.csv", stringsAsFactors = F)
+WDICountry <- read.csv("WDICountry.csv", stringsAsFactors = F)
+
+inflation_variables <- c("Inflation, GDP deflator (annual %)", "GDP deflator (base year varies by country)", "Inflation, consumer prices (annual %)")
+inflation_Indicator.Code <- c("NY.GDP.DEFL.KD.ZG", "NY.GDP.DEFL.ZS", "FP.CPI.TOTL.ZG")
+
+G20_countries <- c("ARG", "AUS", "BRA", "CAN", "CHN", "DEU", "FRA", "IND", "IDN", "ITA", "JPN", "MEX", "RUS", "SAU", "ZAF", "KOR", "TUR", "GBR" ,"USA")
+
+
+# DATA WRANGLING
+WDIData$ï..Country.Name <- NULL
+WDIData$Indicator.Name <- NULL
+WDIData_1 <- gather(WDIData, key = "Year", value = "Value", -Country.Code, -Indicator.Code)
+WDIData_2 <- spread(WDIData_1, key = "Indicator.Code", value = "Value")
+WDIData_2$Year <- str_replace(WDIData_2$Year, "X", "") %>% as.numeric()
+
+# removing inflation related variables' columns
+WDIData_2A <- WDIData_2 %>% select(-NY.GDP.DEFL.KD.ZG, -NY.GDP.DEFL.ZS, -FP.CPI.TOTL.ZG)
+
+# removing missing columns where more than 1/2 of observations are missing values
+WDIData_col_NA <- map_int(WDIData_2A, ~sum(is.na(.x)))
+nrow_WDIData_2A <- nrow(WDIData_2A)
+WDIData_col_NA_which <- ifelse(WDIData_col_NA <= nrow_WDIData_2A/2, T, F) %>% which() # nrow_WDIData_2/2 because only 50% i.e. 1/2 missing values are allowed
+WDIData_3 <- WDIData_2A[, WDIData_col_NA_which]
+
+# removing rows where year is missing and truncating it to 1986-2016
+WDIData_4 <- WDIData_3[which(!is.na(WDIData_3$Year)),]
+
+# imputing missing values column wise using linear interpolation
+WDIData_5 <- WDIData_4 %>% arrange(Country.Code, Year)
+for(i in 1:ncol(WDIData_5)){
+  WDIData_5[, i] <- na_interpolation(WDIData_5[, i], option = "linear")
+}
+
+
+
+# left joining outcome variable inflation
+inflation_consumer <- WDIData_2 %>% select(Country.Code, Year, Inflation = FP.CPI.TOTL.ZG)
+inflation_consumer <- inflation_consumer[which(!is.na(inflation_consumer$Year)),]
+inflation_consumer <- inflation_consumer %>% arrange(Country.Code, Year)
+inflation_consumer$Inflation <- na_interpolation(inflation_consumer$Inflation, option = "linear")
+WDIData_6 <- left_join(WDIData_5, inflation_consumer, by = c("Country.Code", "Year"))
+
+# binary treatment variable for oil price shock
+# if increase in price is more than 50 % from 12 month lag then a price shock, only positive shocks included
+brent_month$Date <- brent_month$Date %>% as.Date()
+brent_month$Year <- year(brent_month$Date)
+brent_month$price_change <- (brent_month$Price - lag(brent_month$Price, n = 12))/brent_month$Price
+brent_month <- brent_month %>% filter(price_change > 0)
+brent_month$Shock <- ifelse(brent_month$price_change >= 0.5, 1, 0)
+brent_month$price_change <- NULL
+
+treatment <- brent_month %>% 
+  na.omit() %>% 
+  group_by(Year) %>% 
+  summarise(treatment = sum(Shock)) %>% 
+  mutate(treatment = ifelse(treatment > 0, 1, 0))
+
+# we will ad one year in treatment so that feature is one year back and is not affect by treatment
+treatment$Year <- treatment$Year + 1
+
+# joining treatment to our final dataset
+WDIData_6 <- left_join(WDIData_6, treatment, by = "Year")
+final_dataset <- WDIData_6 %>% na.omit()
+
+# proportion of treatment variables
+sum(final_dataset$treatment)/nrow(final_dataset) # 0.07142857
+
+# arranging by country and year
+final_dataset <- final_dataset %>% arrange(Country.Code, Year)
+
+# DATA ANALYSIS
+# estimating heterogenous treatment effect of oil price shock on inflation
+
+# dividing data into train and test
+set.seed(1996)
+cases <- sample(seq_len(nrow(final_dataset)), round(nrow(final_dataset)*0.6))
+train <- final_dataset[cases,]
+test <- final_dataset[-cases,]
+
+# estimating the causal forest
+CF <- causal_forest(
+  X = train[, -c(1, 2, ncol(final_dataset)-1, ncol(final_dataset))],
+  Y = train$Inflation,
+  W = train$treatment,
+  num.trees = 5000,
+  seed = 1996
+)
+
+preds <- predict(
+  object = CF, 
+  newdata = test[, -c(1, 2, ncol(final_dataset)-1, ncol(final_dataset))], 
+  estimate.variance = TRUE
+) %>% abs()
+
+test <- cbind(test, preds)
+
+variable_importance <- CF %>% 
+  variable_importance() %>% 
+  as.data.frame() %>% 
+  mutate(variable = colnames(CF$X.orig)) %>% 
+  arrange(desc(V1))
+
+colnames(WDISeries)[1] <- colnames(variable_importance)[2]
+variable_importance <- left_join(variable_importance, WDISeries, by = "variable")
+
+# saving variable importance
+
+write.csv(variable_importance, file = "variable_importance.csv")
+
+# Estimating individual effect for G20 countries
+G20_dataset <- final_dataset %>% filter(Country.Code %in% G20_countries, Year == 2019) 
+
+G20_preds <- predict(
+  object = CF, 
+  newdata = G20_dataset[, -c(1, 2, ncol(G20_dataset)-1, ncol(G20_dataset))], 
+  estimate.variance = TRUE) %>%
+  abs()
+
+G20_dataset <- cbind(G20_dataset, G20_preds)
+
+# Average treatment effect
+average_treatment_effect <- average_treatment_effect(CF) %>% abs()
+paste("95% CI for the ATE:", round ( average_treatment_effect[1] , 3) ,"+/ -", round ( qnorm (0.975) * average_treatment_effect[2] , 3))
+
+
+# PLOTS
+
+# G20 countries bar plot
+G20_plot <- G20_dataset %>% ggplot(aes(x = Country.Code, y = predictions)) + geom_col() + gghighlight(Country.Code == "IND")
+
+
+# plotting one of the tree in forest
+tree_plot <- CF %>% get_tree(88) %>% plot()
+
+```
+
+
+```{r causal tree diagram}
+CF %>% get_tree(222) %>% plot()
+```
+
+```{r average treatment effect}
+average_treatment_effect
+paste("95% CI for the ATE:", round ( average_treatment_effect[1] , 3) ,"+/ -", round ( qnorm (0.975) * average_treatment_effect[2] , 3))
+```
+
+```{r variable importance}
+variable_importance %>% 
+  select(Indicator.Name, V1) %>%
+  top_n(n = 20, wt = V1) %>% 
+  kable(caption = 'Top 20 Variables by their Contribution')
+```
+
+```{r G20, fig.width = 10}
+G20_dataset %>% ggplot(aes(x = Country.Code, y = predictions)) +
+  geom_col() +
+  gghighlight(Country.Code == "IND") +
+  theme_economist_white()
+```
+
